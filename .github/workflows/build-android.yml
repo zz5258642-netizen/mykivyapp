@@ -22,7 +22,7 @@ jobs:
         with:
           python-version: "3.10"
 
-      # 关键：sdkmanager(新版 cmdline-tools)需要 Java 17 才不会报 class file version 61
+      # sdkmanager 新版要求 Java 17（否则会出现 class file version 61 等错误）
       - name: Set up Java 17
         uses: actions/setup-java@v4
         with:
@@ -49,7 +49,6 @@ jobs:
         run: |
           set -eux
           python -m pip install --upgrade pip
-          # buildozer + 兼容的 cython 版本
           pip install buildozer==1.5.0 cython==0.29.36
 
       - name: Prepare Android SDK (cmdline-tools + sdkmanager shim)
@@ -61,7 +60,6 @@ jobs:
           mkdir -p "$SDKROOT"
           cd /tmp
 
-          # 固定一个稳定版本的 cmdline-tools，避免“找不到 sdkmanager / 版本乱跳”
           curl -fsSL -o cmdline-tools.zip https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
           rm -rf /tmp/cmdline-tools-tmp
           mkdir -p /tmp/cmdline-tools-tmp
@@ -73,22 +71,18 @@ jobs:
           mv /tmp/cmdline-tools-tmp/cmdline-tools "$SDKROOT/cmdline-tools/latest"
           rm -rf /tmp/cmdline-tools-tmp
 
-          # buildozer/p4a 有时会找旧路径 tools/bin/sdkmanager，所以我们做一个兼容链接
+          # 兼容旧路径 tools/bin/sdkmanager（buildozer/p4a 有时会去找它）
           mkdir -p "$SDKROOT/tools/bin"
           ln -sf "$SDKROOT/cmdline-tools/latest/bin/sdkmanager" "$SDKROOT/tools/bin/sdkmanager"
 
-          # 关键：同一个 step 里立刻生效，不要依赖 GITHUB_PATH（它要下一个 step 才生效）
+          # 同一 step 里立即生效（不要只靠 GITHUB_PATH）
           export ANDROID_HOME="$SDKROOT"
           export ANDROID_SDK_ROOT="$SDKROOT"
           export PATH="$SDKROOT/cmdline-tools/latest/bin:$SDKROOT/tools/bin:$PATH"
 
-          # 验证：必须能运行
           sdkmanager --version
-
-          # 接受许可协议（不让它因为等待输入而卡死）
           yes | sdkmanager --sdk_root="$SDKROOT" --licenses >/dev/null || true
 
-          # 安装：平台工具 + 平台 + build-tools（两个版本都装，最大兼容）
           sdkmanager --sdk_root="$SDKROOT" \
             "platform-tools" \
             "platforms;android-33" \
@@ -108,28 +102,25 @@ jobs:
             sys.exit(1)
 
           arch = "${{ matrix.arch }}".strip()
-          txt = spec.read_text(encoding="utf-8", errors="ignore").splitlines()
 
-          def set_or_add(key, value):
-            nonlocal txt
-            pat = re.compile(rf"^\s*{re.escape(key)}\s*=")
-            for i, line in enumerate(txt):
-              if pat.match(line):
-                txt[i] = f"{key} = {value}"
-                return
-            # 没有就追加到文件末尾（最稳）
-            txt.append(f"{key} = {value}")
+          lines = spec.read_text(encoding="utf-8", errors="ignore").splitlines()
+          changed = False
 
-          # 用新格式 android.archs（避免 old android.arch 的警告）
-          set_or_add("android.archs", arch)
+          # 同时兼容旧字段 android.arch 与新字段 android.archs
+          for i, line in enumerate(lines):
+            if re.match(r"^\s*android\.archs\s*=", line):
+              lines[i] = f"android.archs = {arch}"
+              changed = True
+            if re.match(r"^\s*android\.arch\s*=", line):
+              lines[i] = f"android.archs = {arch}"
+              changed = True
 
-          # 可选：保证 API/minapi 有值（你本来有就不会改）
-          # 如果你希望固定 API，也可以启用下面两行
-          # set_or_add("android.api", "33")
-          # set_or_add("android.minapi", "21")
+          if not changed:
+            # 没有就追加一行（最稳，不会因为找不到 section 而失败）
+            lines.append(f"android.archs = {arch}")
 
-          spec.write_text("\n".join(txt) + "\n", encoding="utf-8")
-          print("Patched buildozer.spec -> android.archs =", arch)
+          spec.write_text("\n".join(lines) + "\n", encoding="utf-8")
+          print("OK: buildozer.spec -> android.archs =", arch)
           PY
 
       - name: Build APK (${{ matrix.arch }})
@@ -139,11 +130,7 @@ jobs:
           export ANDROID_HOME="$HOME/.buildozer/android/platform/android-sdk"
           export ANDROID_SDK_ROOT="$ANDROID_HOME"
           export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/tools/bin:$PATH"
-
-          # 保险：打印一下确认 sdkmanager 可用
           sdkmanager --version
-
-          # 构建
           buildozer -v android debug
 
       - name: Collect APK
@@ -151,7 +138,6 @@ jobs:
         run: |
           set -eux
           mkdir -p dist
-          # buildozer 产物一般在 bin/*.apk
           ls -lah bin || true
           APK_PATH="$(ls -1 bin/*.apk | head -n 1)"
           if [ -z "${APK_PATH:-}" ]; then
