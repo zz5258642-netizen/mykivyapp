@@ -16,82 +16,85 @@ jobs:
         with:
           python-version: "3.10"
 
-      - name: Install system deps
-        shell: bash
-        run: |
-          set -eux
-          sudo apt-get update
-          sudo apt-get install -y \
-            zip unzip git curl \
-            build-essential ccache \
-            libffi-dev libssl-dev libz-dev
-
-      # ✅ 关键点1：先装 Java 8，只用于运行 sdkmanager（避免 JAXB/XmlSchema 报错）
-      - name: Set up Java 8 (for sdkmanager)
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: "8"
-
-      - name: Install buildozer
-        shell: bash
-        run: |
-          set -eux
-          python -m pip install --upgrade pip
-          pip install buildozer==1.5.0 Cython==0.29.36
-
-      # ✅ 关键点2：把 cmdline-tools 安装到 buildozer 期望的 SDK 目录，并创建旧路径 tools/bin/sdkmanager
-      - name: Install Android cmdline-tools + sdkmanager (compat path)
-        shell: bash
-        run: |
-          set -eux
-
-          SDKROOT="$HOME/.buildozer/android/platform/android-sdk"
-          mkdir -p "$SDKROOT"
-          cd /tmp
-
-          curl -fsSL -o cmdline-tools.zip https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
-          unzip -q cmdline-tools.zip -d /tmp/cmdline-tools-tmp
-          rm -f cmdline-tools.zip
-
-          rm -rf "$SDKROOT/cmdline-tools/latest"
-          mkdir -p "$SDKROOT/cmdline-tools"
-          mv /tmp/cmdline-tools-tmp/cmdline-tools "$SDKROOT/cmdline-tools/latest"
-          rm -rf /tmp/cmdline-tools-tmp
-
-          # 旧路径兼容：让 buildozer 不再报 tools/bin/sdkmanager 不存在
-          mkdir -p "$SDKROOT/tools/bin"
-          ln -sf "$SDKROOT/cmdline-tools/latest/bin/sdkmanager" "$SDKROOT/tools/bin/sdkmanager"
-
-          # 加入 PATH（让后续步骤可直接用 sdkmanager）
-          echo "$SDKROOT/tools/bin" >> "$GITHUB_PATH"
-          echo "$SDKROOT/platform-tools" >> "$GITHUB_PATH"
-
-          # 接受协议 + 安装必须组件（含 build-tools 36.1.0，解决 aidl/aapt 等工具缺失）
-          yes | "$SDKROOT/tools/bin/sdkmanager" --sdk_root="$SDKROOT" --licenses >/dev/null || true
-          "$SDKROOT/tools/bin/sdkmanager" --sdk_root="$SDKROOT" \
-            "platform-tools" \
-            "platforms;android-33" \
-            "build-tools;36.1.0"
-
-          # 保险：确认 aidl 存在（不存在就立刻失败，不浪费你时间）
-          test -x "$SDKROOT/build-tools/36.1.0/aidl"
-
-      # ✅ 关键点3：再切回 Java 17 给编译用（gradle/编译更稳）
-      - name: Set up Java 17 (for build)
+      # 关键：全程统一 Java 17（sdkmanager / gradle 都用它）
+      - name: Set up Java 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "17"
 
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            zip unzip git curl \
+            build-essential \
+            libffi-dev libssl-dev \
+            zlib1g-dev
+
+      - name: Install buildozer
+        run: |
+          python -m pip install --upgrade pip
+          pip install buildozer==1.5.0 cython==0.29.36
+
+      # ✅ 一次性把 Android SDK 装到 buildozer 默认会找的目录里
+      - name: Install Android SDK (cmdline-tools) + accept licenses + install build-tools
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          SDKROOT="$HOME/.buildozer/android/platform/android-sdk"
+          mkdir -p "$SDKROOT"
+          mkdir -p "$SDKROOT/cmdline-tools"
+          mkdir -p "$SDKROOT/tools/bin"
+
+          cd /tmp
+          curl -fsSL -o cmdline-tools.zip \
+            https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
+
+          rm -rf /tmp/cmdline-tools-tmp
+          unzip -q cmdline-tools.zip -d /tmp/cmdline-tools-tmp
+
+          # 放到 cmdline-tools/latest（官方结构）
+          rm -rf "$SDKROOT/cmdline-tools/latest"
+          mkdir -p "$SDKROOT/cmdline-tools/latest"
+          mv /tmp/cmdline-tools-tmp/cmdline-tools/* "$SDKROOT/cmdline-tools/latest/"
+
+          SDKMANAGER="$SDKROOT/cmdline-tools/latest/bin/sdkmanager"
+
+          # ✅ buildozer 旧逻辑会找 tools/bin/sdkmanager，所以做一个“兼容入口”
+          ln -sf "$SDKMANAGER" "$SDKROOT/tools/bin/sdkmanager"
+
+          # ✅ PATH（可选，但有用）
+          echo "$SDKROOT/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
+          echo "$SDKROOT/tools/bin" >> "$GITHUB_PATH"
+          echo "$SDKROOT/platform-tools" >> "$GITHUB_PATH"
+
+          # ✅ 用 Java 17 跑 sdkmanager（避免你遇到的 61/52 问题）
+          java -version
+
+          # ✅ 接受许可证（忽略 broken pipe）
+          yes | "$SDKMANAGER" --sdk_root="$SDKROOT" --licenses >/dev/null || true
+
+          # ✅ 安装必须包：platform-tools + 平台 + build-tools（含 aidl）+ NDK
+          "$SDKMANAGER" --sdk_root="$SDKROOT" \
+            "platform-tools" \
+            "platforms;android-33" \
+            "build-tools;36.1.0" \
+            "ndk;25.2.9519653"
+
+          # ✅ 硬校验：没有 aidl 就直接失败（不再让你后面 buildozer 才失败）
+          test -x "$SDKROOT/build-tools/36.1.0/aidl" || (echo "ERROR: aidl not found in build-tools;36.1.0" && ls -la "$SDKROOT/build-tools" && exit 1)
+
       - name: Build APK
         shell: bash
-        env:
-          ANDROIDSDK: /home/runner/.buildozer/android/platform/android-sdk
-          ANDROID_HOME: /home/runner/.buildozer/android/platform/android-sdk
-          ANDROID_SDK_ROOT: /home/runner/.buildozer/android/platform/android-sdk
         run: |
-          set -eux
+          set -euxo pipefail
+          export ANDROIDSDK="$HOME/.buildozer/android/platform/android-sdk"
+          export ANDROIDNDK="$ANDROIDSDK/ndk/25.2.9519653"
+          export ANDROIDAPI="33"
+          export ANDROIDMINAPI="21"
+
           buildozer -v android debug
 
       - name: Upload APK artifact
@@ -99,4 +102,3 @@ jobs:
         with:
           name: apk
           path: bin/*.apk
-          if-no-files-found: error
