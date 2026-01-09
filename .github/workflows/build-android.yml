@@ -27,21 +27,49 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y zip unzip git build-essential ccache libffi-dev libssl-dev libz-dev
 
-      # 安装 Android SDK（系统 SDK），并设置 ANDROID_SDK_ROOT
+      # 关键：清掉 buildozer 自己那套 SDK（否则它一直用 ~/.buildozer/...）
+      - name: Clean buildozer cache
+        run: |
+          rm -rf ~/.buildozer
+          rm -rf ~/.android
+
+      # 安装系统 Android SDK（Actions 官方方式）
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
 
-      - name: Accept licenses + Install SDK packages
+      # 固定安装一套稳定的 build-tools / platforms / ndk，并接受 license
+      - name: Install SDK packages + accept licenses
         shell: bash
         run: |
           mkdir -p ~/.android
           touch ~/.android/repositories.cfg
 
+          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT"
           sdkmanager --version
-          yes | sdkmanager --licenses || true
 
-          # 这里固定一套稳定组合（避免莫名其妙去装 36.x）
+          yes | sdkmanager --licenses || true
           sdkmanager "platform-tools" "platforms;android-33" "build-tools;33.0.2" "ndk;25.2.9519653"
+
+      # 关键：把 buildozer.spec 强制写入“系统 SDK 路径”，并固定 API/Build-tools，避免它去装 36.1
+      - name: Patch buildozer.spec to use system SDK
+        shell: bash
+        run: |
+          SDK="$ANDROID_SDK_ROOT"
+          NDK="$ANDROID_SDK_ROOT/ndk/25.2.9519653"
+
+          # 如果仓库里没有 buildozer.spec，这里会直接失败（你就把失败截图发我）
+          test -f buildozer.spec
+
+          # 固定 api / build-tools（避免它找 36.1）
+          grep -q '^android\.api' buildozer.spec && sed -i 's/^android\.api.*/android.api = 33/' buildozer.spec || echo 'android.api = 33' >> buildozer.spec
+          grep -q '^android\.sdk_build_tools' buildozer.spec && sed -i 's/^android\.sdk_build_tools.*/android.sdk_build_tools = 33.0.2/' buildozer.spec || echo 'android.sdk_build_tools = 33.0.2' >> buildozer.spec
+
+          # 强制 SDK/NDK 路径（让它别用 ~/.buildozer/...）
+          grep -q '^android\.sdk_path' buildozer.spec && sed -i "s|^android\.sdk_path.*|android.sdk_path = $SDK|" buildozer.spec || echo "android.sdk_path = $SDK" >> buildozer.spec
+          grep -q '^android\.ndk_path' buildozer.spec && sed -i "s|^android\.ndk_path.*|android.ndk_path = $NDK|" buildozer.spec || echo "android.ndk_path = $NDK" >> buildozer.spec
+
+          echo "---- buildozer.spec (tail) ----"
+          tail -n 60 buildozer.spec
 
       - name: Install buildozer
         run: |
@@ -49,16 +77,11 @@ jobs:
           pip install buildozer==1.5.0 Cython==0.29.36
 
       - name: Build APK
-        shell: bash
         env:
           ANDROID_SDK_ROOT: ${{ env.ANDROID_SDK_ROOT }}
           ANDROID_HOME: ${{ env.ANDROID_SDK_ROOT }}
-          ANDROIDSDK: ${{ env.ANDROID_SDK_ROOT }}
-          ANDROID_NDK_HOME: ${{ env.ANDROID_SDK_ROOT }}/ndk/25.2.9519653
-          ANDROIDNDK: ${{ env.ANDROID_SDK_ROOT }}/ndk/25.2.9519653
         run: |
           echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT"
-          echo "ANDROID_NDK_HOME=$ANDROID_NDK_HOME"
           buildozer -v android debug
 
       - name: Upload APK artifact
