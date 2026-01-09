@@ -7,7 +7,7 @@ jobs:
   build:
     name: build (${{ matrix.arch }})
     runs-on: ubuntu-22.04
-
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -17,37 +17,42 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Set up Python 3.10
         uses: actions/setup-python@v5
         with:
           python-version: "3.10"
 
+      # 关键：sdkmanager(新版 cmdline-tools)需要 Java 17 才不会报 class file version 61
       - name: Set up Java 17
         uses: actions/setup-java@v4
         with:
           distribution: "temurin"
           java-version: "17"
 
-      - name: Install system deps
+      - name: Install system dependencies
+        shell: bash
         run: |
+          set -eux
           sudo apt-get update
           sudo apt-get install -y \
             zip unzip git curl \
-            openjdk-17-jdk \
-            build-essential \
-            ccache \
-            libffi-dev libssl-dev libz-dev \
-            python3-dev pkg-config \
-            autoconf automake libtool \
-            zlib1g-dev
+            build-essential ccache \
+            libffi-dev libssl-dev \
+            zlib1g-dev libbz2-dev liblzma-dev \
+            libsqlite3-dev \
+            libncurses5-dev libncursesw5-dev \
+            libreadline-dev libgdbm-dev libnss3-dev \
+            libjpeg-dev
 
       - name: Install build tools (buildozer/p4a)
+        shell: bash
         run: |
+          set -eux
           python -m pip install --upgrade pip
-          pip install "buildozer==1.5.0" "cython==0.29.36"
+          # buildozer + 兼容的 cython 版本
+          pip install buildozer==1.5.0 cython==0.29.36
 
-      # 关键：准备 Android SDK + cmdline-tools，并做 tools/bin/sdkmanager 兼容链接（避免你之前反复出现的 sdkmanager 找不到、JDK版本不匹配）
-      - name: Prepare Android SDK (cmdline-tools) + sdkmanager shim
+      - name: Prepare Android SDK (cmdline-tools + sdkmanager shim)
         shell: bash
         run: |
           set -eux
@@ -56,7 +61,7 @@ jobs:
           mkdir -p "$SDKROOT"
           cd /tmp
 
-          # 下载官方 cmdline-tools（稳定）
+          # 固定一个稳定版本的 cmdline-tools，避免“找不到 sdkmanager / 版本乱跳”
           curl -fsSL -o cmdline-tools.zip https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
           rm -rf /tmp/cmdline-tools-tmp
           mkdir -p /tmp/cmdline-tools-tmp
@@ -68,88 +73,96 @@ jobs:
           mv /tmp/cmdline-tools-tmp/cmdline-tools "$SDKROOT/cmdline-tools/latest"
           rm -rf /tmp/cmdline-tools-tmp
 
-          # buildozer/p4a 有时会去找 $SDKROOT/tools/bin/sdkmanager（老路径）
-          # 我们创建一个兼容链接，指向新 cmdline-tools 的 sdkmanager
+          # buildozer/p4a 有时会找旧路径 tools/bin/sdkmanager，所以我们做一个兼容链接
           mkdir -p "$SDKROOT/tools/bin"
           ln -sf "$SDKROOT/cmdline-tools/latest/bin/sdkmanager" "$SDKROOT/tools/bin/sdkmanager"
 
-          # PATH
-          echo "$SDKROOT/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
-          echo "$SDKROOT/tools/bin" >> "$GITHUB_PATH"
+          # 关键：同一个 step 里立刻生效，不要依赖 GITHUB_PATH（它要下一个 step 才生效）
+          export ANDROID_HOME="$SDKROOT"
+          export ANDROID_SDK_ROOT="$SDKROOT"
+          export PATH="$SDKROOT/cmdline-tools/latest/bin:$SDKROOT/tools/bin:$PATH"
 
-          # 输出确认
-          which sdkmanager
-          sdkmanager --version || true
+          # 验证：必须能运行
+          sdkmanager --version
 
-      - name: Accept licenses + install Android packages
-        shell: bash
-        run: |
-          set -eux
+          # 接受许可协议（不让它因为等待输入而卡死）
+          yes | sdkmanager --sdk_root="$SDKROOT" --licenses >/dev/null || true
 
-          SDKROOT="$HOME/.buildozer/android/platform/android-sdk"
-
-          # 接受许可（防止你之前卡在 license）
-          yes | sdkmanager --sdk_root="$SDKROOT" --licenses || true
-
-          # 安装必需组件：
-          # build-tools 36.1.0：解决你之前 aidl not found
+          # 安装：平台工具 + 平台 + build-tools（两个版本都装，最大兼容）
           sdkmanager --sdk_root="$SDKROOT" \
             "platform-tools" \
             "platforms;android-33" \
-            "build-tools;36.1.0" \
-            "ndk;25.2.9519653"
+            "build-tools;33.0.2" \
+            "build-tools;36.1.0"
 
-          # 再接受一次许可，确保完整
-          yes | sdkmanager --sdk_root="$SDKROOT" --licenses || true
-
-      # 关键：自动下载中文字体并放进项目（让 APK 里中文不再“口口口/乱码方块”）
-      - name: Download Chinese font (NotoSansSC)
-        shell: bash
-        run: |
-          set -eux
-          mkdir -p fonts
-          # 从 Google Noto 仓库下载（稳定）
-          curl -fsSL -o fonts/NotoSansSC-Regular.otf \
-            https://raw.githubusercontent.com/googlefonts/noto-cjk/main/Sans/OTF/SimplifiedChinese/NotoSansSC-Regular.otf
-          ls -lh fonts/NotoSansSC-Regular.otf
-
-      # 关键：每个矩阵架构都要构建一次，因此我们自动改 buildozer.spec 里的 android.archs
-      - name: Patch buildozer.spec for arch
+      - name: Patch buildozer.spec for matrix arch
         shell: bash
         run: |
           set -eux
           python - << 'PY'
-          import re
-          path = "buildozer.spec"
-          txt = open(path, "r", encoding="utf-8").read()
-          arch = "${{ matrix.arch }}"
-          # 强制写入 android.archs
-          if re.search(r"^\s*android\.archs\s*=", txt, flags=re.M):
-            txt = re.sub(r"^\s*android\.archs\s*=.*$", f"android.archs = {arch}", txt, flags=re.M)
-          else:
-            txt += f"\nandroid.archs = {arch}\n"
-          open(path, "w", encoding="utf-8").write(txt)
-          print("Patched android.archs =", arch)
-          PY
-          grep -n "android.archs" buildozer.spec || true
+          import pathlib, re, sys
 
-      - name: Build APK
+          spec = pathlib.Path("buildozer.spec")
+          if not spec.exists():
+            print("ERROR: buildozer.spec not found in repo root.")
+            sys.exit(1)
+
+          arch = "${{ matrix.arch }}".strip()
+          txt = spec.read_text(encoding="utf-8", errors="ignore").splitlines()
+
+          def set_or_add(key, value):
+            nonlocal txt
+            pat = re.compile(rf"^\s*{re.escape(key)}\s*=")
+            for i, line in enumerate(txt):
+              if pat.match(line):
+                txt[i] = f"{key} = {value}"
+                return
+            # 没有就追加到文件末尾（最稳）
+            txt.append(f"{key} = {value}")
+
+          # 用新格式 android.archs（避免 old android.arch 的警告）
+          set_or_add("android.archs", arch)
+
+          # 可选：保证 API/minapi 有值（你本来有就不会改）
+          # 如果你希望固定 API，也可以启用下面两行
+          # set_or_add("android.api", "33")
+          # set_or_add("android.minapi", "21")
+
+          spec.write_text("\n".join(txt) + "\n", encoding="utf-8")
+          print("Patched buildozer.spec -> android.archs =", arch)
+          PY
+
+      - name: Build APK (${{ matrix.arch }})
         shell: bash
-        env:
-          ANDROID_HOME: ${{ runner.temp }}/android-home-not-used
         run: |
           set -eux
+          export ANDROID_HOME="$HOME/.buildozer/android/platform/android-sdk"
+          export ANDROID_SDK_ROOT="$ANDROID_HOME"
+          export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/tools/bin:$PATH"
 
-          # 强制让 buildozer/p4a 使用我们准备的 SDK
-          export ANDROIDSDK="$HOME/.buildozer/android/platform/android-sdk"
-          export ANDROID_SDK_ROOT="$ANDROIDSDK"
-          export ANDROID_HOME="$ANDROIDSDK"
-          export ANDROID_NDK_HOME="$ANDROIDSDK/ndk/25.2.9519653"
+          # 保险：打印一下确认 sdkmanager 可用
+          sdkmanager --version
 
+          # 构建
           buildozer -v android debug
 
-      - name: Upload APK artifact
+      - name: Collect APK
+        shell: bash
+        run: |
+          set -eux
+          mkdir -p dist
+          # buildozer 产物一般在 bin/*.apk
+          ls -lah bin || true
+          APK_PATH="$(ls -1 bin/*.apk | head -n 1)"
+          if [ -z "${APK_PATH:-}" ]; then
+            echo "ERROR: APK not found under bin/"
+            exit 1
+          fi
+          cp -v "$APK_PATH" "dist/mykivyapp-${{ matrix.arch }}-debug.apk"
+
+      - name: Upload APK artifact (${{ matrix.arch }})
         uses: actions/upload-artifact@v4
         with:
           name: apk-${{ matrix.arch }}
-          path: bin/*.apk
+          path: dist/mykivyapp-${{ matrix.arch }}-debug.apk
+          if-no-files-found: error
