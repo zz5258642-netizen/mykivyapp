@@ -6,7 +6,6 @@ on:
 jobs:
   build:
     runs-on: ubuntu-22.04
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -25,26 +24,30 @@ jobs:
       - name: Install system deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
-            zip unzip git curl \
-            build-essential ccache \
-            libffi-dev libssl-dev \
-            libz-dev
+          sudo apt-get install -y zip unzip git curl build-essential \
+            libffi-dev libssl-dev libz-dev
 
       - name: Install buildozer
         run: |
           python -m pip install --upgrade pip
           pip install buildozer==1.5.0 cython==0.29.36
 
-      # ✅ 关键：把 SDK / build-tools 装进 buildozer 真正使用的目录里
-      - name: Prepare Android SDK for buildozer (install build-tools 36.1.0)
+      # ✅ 关键：把 SDK / build-tools 直接装到 buildozer 真正使用的目录
+      - name: Install Android cmdline-tools + accept licenses + install build-tools
         shell: bash
         run: |
           set -eux
 
           SDKROOT="$HOME/.buildozer/android/platform/android-sdk"
-          mkdir -p "$SDKROOT/cmdline-tools"
+          mkdir -p "$SDKROOT/cmdline-tools" "$SDKROOT/licenses"
 
+          # 1) 写入 licenses（避免 y/N 卡住）
+          # 这些 hash 是 Android SDK 常用的 license 接受标识
+          echo "24333f8a63b6825ea9c5514f83c2829b004d1fee" >  "$SDKROOT/licenses/android-sdk-license"
+          echo "84831b9409646a918e30573bab4c9c91346d8abd" >> "$SDKROOT/licenses/android-sdk-license"
+          echo "d56f5187479451eabf01fb78af6dfcb131a6481e" >  "$SDKROOT/licenses/android-sdk-preview-license"
+
+          # 2) 安装 cmdline-tools（我们只用新的 sdkmanager）
           cd /tmp
           curl -fsSL -o cmdline-tools.zip https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
           unzip -q cmdline-tools.zip -d cmdline-tools-tmp
@@ -57,14 +60,15 @@ jobs:
 
           export PATH="$SDKROOT/cmdline-tools/latest/bin:$SDKROOT/platform-tools:$PATH"
 
-          yes | sdkmanager --sdk_root="$SDKROOT" --licenses
-
+          # 3) 强制安装：platform + build-tools（36.1.0 必须存在才有 aidl）
           sdkmanager --sdk_root="$SDKROOT" \
             "platform-tools" \
             "platforms;android-33" \
-            "platforms;android-34" \
-            "build-tools;36.1.0" \
-            "build-tools;33.0.2"
+            "build-tools;36.1.0"
+
+          # 4) 立刻验证：aidl 必须存在（否则直接让 workflow 在这里失败）
+          ls -la "$SDKROOT/build-tools" || true
+          test -x "$SDKROOT/build-tools/36.1.0/aidl"
 
       - name: Build APK
         run: |
