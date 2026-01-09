@@ -6,6 +6,7 @@ on:
 jobs:
   build:
     runs-on: ubuntu-22.04
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -28,6 +29,25 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install buildozer==1.5.0 cython==0.29.36
+
+      - name: Download Android SDK (first time)
+        shell: bash
+        run: |
+          buildozer -v android update || true
+
+      - name: Accept Android SDK licenses + install build-tools
+        shell: bash
+        run: |
+          SDKMANAGER="$(find "$HOME/.buildozer/android/platform/android-sdk" -name sdkmanager -type f | head -n 1)"
+          echo "sdkmanager = $SDKMANAGER"
+
+          if [ -z "$SDKMANAGER" ]; then
+            echo "sdkmanager not found. Try running buildozer update again."
+            exit 1
+          fi
+
+          yes | "$SDKMANAGER" --licenses
+          "$SDKMANAGER" "platform-tools" "platforms;android-34" "build-tools;34.0.0"
 
       - name: Build APK
         run: |
