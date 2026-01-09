@@ -1,11 +1,27 @@
 [app]
 title = MyKivyApp
 package.name = mykivyapp
-package.domain = org.test
+package.domain = org.zz5258642
+
+version = 0.2
+
 source.dir = .
-version = 0.1
+source.include_exts = py,kv,png,jpg,jpeg,ttf,otf
+source.include_patterns = fonts/*
+
 requirements = python3,kivy
-android.api = 30
+
+orientation = portrait
+fullscreen = 1
+
+# 你要的：32位/64位会由 workflow 自动改成单个 arch 分别构建
+android.archs = arm64-v8a
+
+android.api = 33
 android.minapi = 21
-android.arch = arm64-v8a
-android.accept_license = True
+
+# 常用权限（可按需删）
+android.permissions = INTERNET
+
+# 可选：开启日志更清晰
+android.logcat_filters = *:S python:D
