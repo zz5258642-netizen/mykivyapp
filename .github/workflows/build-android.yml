@@ -2,6 +2,8 @@ name: Build Android APK (Kivy)
 
 on:
   workflow_dispatch:
+  push:
+    branches: [ "main" ]
 
 jobs:
   build:
@@ -16,40 +18,44 @@ jobs:
         with:
           python-version: "3.10"
 
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: "temurin"
+          java-version: "17"
+
+      # ✅ 关键：用成熟的 action 装 Android SDK + 接受 licenses
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
       - name: Install system deps
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            zip unzip git openjdk-17-jdk \
+            zip unzip git \
             build-essential ccache \
             libffi-dev libssl-dev \
-            libz-dev
+            zlib1g-dev liblzma-dev
+
+      - name: Prepare Android config (avoid sdkmanager crash)
+        run: |
+          mkdir -p ~/.android
+          touch ~/.android/repositories.cfg
+
+      - name: Install build tools (SDK packages) + accept licenses
+        run: |
+          sdkmanager --install "platform-tools" "platforms;android-33" "build-tools;33.0.2"
+          yes | sdkmanager --licenses
 
       - name: Install buildozer
         run: |
-          python -m pip install --upgrade pip
+          python -m pip install --upgrade pip setuptools wheel
           pip install buildozer==1.5.0 cython==0.29.36
 
-      - name: Download Android SDK (first time)
-        shell: bash
-        run: |
-          buildozer -v android update || true
-
-      - name: Accept Android SDK licenses + install build-tools
-        shell: bash
-        run: |
-          SDKMANAGER="$(find "$HOME/.buildozer/android/platform/android-sdk" -name sdkmanager -type f | head -n 1)"
-          echo "sdkmanager = $SDKMANAGER"
-
-          if [ -z "$SDKMANAGER" ]; then
-            echo "sdkmanager not found. Try running buildozer update again."
-            exit 1
-          fi
-
-          yes | "$SDKMANAGER" --licenses
-          "$SDKMANAGER" "platform-tools" "platforms;android-34" "build-tools;34.0.0"
-
       - name: Build APK
+        env:
+          ANDROID_HOME: ${{ env.ANDROID_HOME }}
+          ANDROID_SDK_ROOT: ${{ env.ANDROID_SDK_ROOT }}
         run: |
           buildozer -v android debug
 
