@@ -1,9 +1,7 @@
-name: Build Android APK (Kivy) - 32bit + 64bit
+name: Build Android APK (Kivy) - 32+64
 
 on:
   workflow_dispatch:
-  push:
-    branches: ["main"]
 
 jobs:
   build:
@@ -15,163 +13,143 @@ jobs:
       matrix:
         arch: [arm64-v8a, armeabi-v7a]
 
-    env:
-      ANDROID_API: "33"
-      ANDROID_MINAPI: "21"
-      ANDROID_BUILD_TOOLS: "33.0.2"
-      ANDROID_NDK_PKG: "ndk;25.2.9519653"
-      # buildozer 默认会找这里（我们就按它的默认来）
-      ANDROID_SDK_ROOT: /home/runner/.buildozer/android/platform/android-sdk
-      ANDROID_HOME: /home/runner/.buildozer/android/platform/android-sdk
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.10"
 
-      # 关键：统一 Java 17，sdkmanager 和后续构建都用它
-      - name: Setup Java 17
+      - name: Set up Java 17
         uses: actions/setup-java@v4
         with:
-          distribution: temurin
+          distribution: "temurin"
           java-version: "17"
 
       - name: Install system deps
-        shell: bash
         run: |
-          set -eux
           sudo apt-get update
           sudo apt-get install -y \
-            git zip unzip curl \
-            build-essential ccache \
-            libffi-dev libssl-dev zlib1g-dev \
-            liblzma-dev libncurses5-dev \
-            autoconf automake libtool pkg-config
+            zip unzip git curl \
+            openjdk-17-jdk \
+            build-essential \
+            ccache \
+            libffi-dev libssl-dev libz-dev \
+            python3-dev pkg-config \
+            autoconf automake libtool \
+            zlib1g-dev
 
-      - name: Install Python deps (buildozer)
+      - name: Install build tools (buildozer/p4a)
+        run: |
+          python -m pip install --upgrade pip
+          pip install "buildozer==1.5.0" "cython==0.29.36"
+
+      # 关键：准备 Android SDK + cmdline-tools，并做 tools/bin/sdkmanager 兼容链接（避免你之前反复出现的 sdkmanager 找不到、JDK版本不匹配）
+      - name: Prepare Android SDK (cmdline-tools) + sdkmanager shim
         shell: bash
         run: |
           set -eux
-          python -m pip install --upgrade pip wheel setuptools
-          python -m pip install buildozer==1.5.0 Cython==0.29.36
 
-      # 关键：安装 cmdline-tools，并放到 buildozer 期望的 SDK 路径里
-      # 同时创建 tools/bin/sdkmanager 兼容旧脚本/旧路径
-      - name: Install Android SDK cmdline-tools + sdkmanager (compatible path)
-        shell: bash
-        run: |
-          set -eux
-
-          echo "$JAVA_HOME/bin" >> "$GITHUB_PATH"
-          java -version
-          which java
-
-          SDKROOT="$ANDROID_SDK_ROOT"
+          SDKROOT="$HOME/.buildozer/android/platform/android-sdk"
           mkdir -p "$SDKROOT"
           cd /tmp
 
-          # 固定一个稳定版本的 cmdline-tools（别用 tools/bin 的旧包）
-          CMDLINE_URL="https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip"
-          curl -fsSL -o cmdline-tools.zip "$CMDLINE_URL"
+          # 下载官方 cmdline-tools（稳定）
+          curl -fsSL -o cmdline-tools.zip https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
           rm -rf /tmp/cmdline-tools-tmp
+          mkdir -p /tmp/cmdline-tools-tmp
           unzip -q cmdline-tools.zip -d /tmp/cmdline-tools-tmp
           rm -f cmdline-tools.zip
 
-          # zip 内部是 cmdline-tools/ 目录
           rm -rf "$SDKROOT/cmdline-tools/latest"
           mkdir -p "$SDKROOT/cmdline-tools"
           mv /tmp/cmdline-tools-tmp/cmdline-tools "$SDKROOT/cmdline-tools/latest"
           rm -rf /tmp/cmdline-tools-tmp
 
-          # 兼容旧路径：tools/bin/sdkmanager
+          # buildozer/p4a 有时会去找 $SDKROOT/tools/bin/sdkmanager（老路径）
+          # 我们创建一个兼容链接，指向新 cmdline-tools 的 sdkmanager
           mkdir -p "$SDKROOT/tools/bin"
           ln -sf "$SDKROOT/cmdline-tools/latest/bin/sdkmanager" "$SDKROOT/tools/bin/sdkmanager"
 
-          # 放进 PATH（后面直接用 sdkmanager）
+          # PATH
+          echo "$SDKROOT/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
           echo "$SDKROOT/tools/bin" >> "$GITHUB_PATH"
-          echo "$SDKROOT/platform-tools" >> "$GITHUB_PATH"
 
-          # 接受 license（防 broken pipe）
-          yes | "$SDKROOT/tools/bin/sdkmanager" --sdk_root="$SDKROOT" --licenses >/dev/null || true
+          # 输出确认
+          which sdkmanager
+          sdkmanager --version || true
 
-          # 安装 SDK 组件（固定版本，避免 build-tools 找不到 / aidl 不存在）
-          "$SDKROOT/tools/bin/sdkmanager" --sdk_root="$SDKROOT" \
+      - name: Accept licenses + install Android packages
+        shell: bash
+        run: |
+          set -eux
+
+          SDKROOT="$HOME/.buildozer/android/platform/android-sdk"
+
+          # 接受许可（防止你之前卡在 license）
+          yes | sdkmanager --sdk_root="$SDKROOT" --licenses || true
+
+          # 安装必需组件：
+          # build-tools 36.1.0：解决你之前 aidl not found
+          sdkmanager --sdk_root="$SDKROOT" \
             "platform-tools" \
-            "platforms;android-${ANDROID_API}" \
-            "build-tools;${ANDROID_BUILD_TOOLS}" \
-            "${ANDROID_NDK_PKG}"
+            "platforms;android-33" \
+            "build-tools;36.1.0" \
+            "ndk;25.2.9519653"
 
-          # 验证：sdkmanager、aidl 是否存在
-          test -x "$SDKROOT/tools/bin/sdkmanager"
-          test -x "$SDKROOT/build-tools/${ANDROID_BUILD_TOOLS}/aidl"
+          # 再接受一次许可，确保完整
+          yes | sdkmanager --sdk_root="$SDKROOT" --licenses || true
 
-      # 每个 arch 单独改 buildozer.spec 的 android.archs（不用你手动改）
-      - name: Patch buildozer.spec for this arch
+      # 关键：自动下载中文字体并放进项目（让 APK 里中文不再“口口口/乱码方块”）
+      - name: Download Chinese font (NotoSansSC)
         shell: bash
         run: |
           set -eux
-          python - <<'PY'
-          from pathlib import Path
+          mkdir -p fonts
+          # 从 Google Noto 仓库下载（稳定）
+          curl -fsSL -o fonts/NotoSansSC-Regular.otf \
+            https://raw.githubusercontent.com/googlefonts/noto-cjk/main/Sans/OTF/SimplifiedChinese/NotoSansSC-Regular.otf
+          ls -lh fonts/NotoSansSC-Regular.otf
+
+      # 关键：每个矩阵架构都要构建一次，因此我们自动改 buildozer.spec 里的 android.archs
+      - name: Patch buildozer.spec for arch
+        shell: bash
+        run: |
+          set -eux
+          python - << 'PY'
           import re
-
+          path = "buildozer.spec"
+          txt = open(path, "r", encoding="utf-8").read()
           arch = "${{ matrix.arch }}"
-          api = "${{ env.ANDROID_API }}"
-          minapi = "${{ env.ANDROID_MINAPI }}"
-          bt = "${{ env.ANDROID_BUILD_TOOLS }}"
-
-          p = Path("buildozer.spec")
-          if not p.exists():
-            raise SystemExit("❌ buildozer.spec not found at repo root")
-
-          txt = p.read_text(encoding="utf-8", errors="ignore")
-
-          def upsert(key, value, text):
-            # 替换已有 key
-            pat = rf"^(\s*{re.escape(key)}\s*=\s*).*$"
-            if re.search(pat, text, flags=re.M):
-              return re.sub(pat, rf"\1{value}", text, flags=re.M)
-            # 不存在就追加到文件末尾（buildozer 会读取）
-            return text.rstrip() + f"\n{key} = {value}\n"
-
-          txt = upsert("android.archs", arch, txt)
-          txt = upsert("android.api", api, txt)
-          txt = upsert("android.minapi", minapi, txt)
-          txt = upsert("android.sdk_build_tools_version", bt, txt)
-
-          p.write_text(txt, encoding="utf-8")
-          print("✅ Patched buildozer.spec for", arch)
+          # 强制写入 android.archs
+          if re.search(r"^\s*android\.archs\s*=", txt, flags=re.M):
+            txt = re.sub(r"^\s*android\.archs\s*=.*$", f"android.archs = {arch}", txt, flags=re.M)
+          else:
+            txt += f"\nandroid.archs = {arch}\n"
+          open(path, "w", encoding="utf-8").write(txt)
+          print("Patched android.archs =", arch)
           PY
+          grep -n "android.archs" buildozer.spec || true
 
-      - name: Clean previous build outputs
+      - name: Build APK
         shell: bash
+        env:
+          ANDROID_HOME: ${{ runner.temp }}/android-home-not-used
         run: |
           set -eux
-          rm -rf .buildozer bin || true
 
-      - name: Build APK (debug)
-        shell: bash
-        run: |
-          set -eux
-          export ANDROID_SDK_ROOT="${ANDROID_SDK_ROOT}"
-          export ANDROID_HOME="${ANDROID_SDK_ROOT}"
+          # 强制让 buildozer/p4a 使用我们准备的 SDK
+          export ANDROIDSDK="$HOME/.buildozer/android/platform/android-sdk"
+          export ANDROID_SDK_ROOT="$ANDROIDSDK"
+          export ANDROID_HOME="$ANDROIDSDK"
+          export ANDROID_NDK_HOME="$ANDROIDSDK/ndk/25.2.9519653"
+
           buildozer -v android debug
 
-          # 给 APK 改名，防止两个架构产物同名覆盖
-          mkdir -p dist
-          for f in bin/*.apk; do
-            [ -f "$f" ] || continue
-            base="$(basename "$f" .apk)"
-            mv "$f" "dist/${base}-${{ matrix.arch }}.apk"
-          done
-          ls -lah dist
-
-      - name: Upload APK artifact (${{ matrix.arch }})
+      - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
           name: apk-${{ matrix.arch }}
-          path: dist/*.apk
-          if-no-files-found: error
+          path: bin/*.apk
